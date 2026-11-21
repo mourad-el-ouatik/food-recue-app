@@ -1,0 +1,81 @@
+name: Mobile Security (MobSF)
+
+on:
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: mobile-security-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  MIN_SCORE: 60
+
+jobs:
+  apk-analysis:
+    name: Build APK + analyse MobSF
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - run: npm ci
+
+      - name: Prebuild Android
+        run: npx expo prebuild --platform android --no-install --clean
+        env:
+          EXPO_PUBLIC_API_URL: https://api.example.invalid
+
+      - name: Build APK release (non signé, analyse seulement)
+        working-directory: android
+        run: ./gradlew assembleRelease --no-daemon
+
+      - name: Démarrer MobSF
+        run: |
+          docker run -d --name mobsf -p 8000:8000 \
+            -e MOBSF_API_KEY=ci-local-key \
+            opensecurity/mobile-security-framework-mobsf:latest
+          for i in $(seq 1 60); do
+            curl -sf http://localhost:8000/ >/dev/null && break
+            sleep 5
+          done
+
+      - name: Scanner l'APK
+        run: |
+          APK=$(find android/app/build/outputs/apk/release -name '*.apk' | head -n1)
+          echo "APK: $APK"
+          HASH=$(curl -sf -F "file=@${APK}" \
+            -H "Authorization: ci-local-key" \
+            http://localhost:8000/api/v1/upload | jq -r .hash)
+          curl -sf -X POST -H "Authorization: ci-local-key" \
+            --data "hash=${HASH}" \
+            http://localhost:8000/api/v1/scan -o scan.json
+          curl -sf -X POST -H "Authorization: ci-local-key" \
+            --data "hash=${HASH}" \
+            http://localhost:8000/api/v1/report_json -o report.json
+          SCORE=$(jq -r '.appsec.security_score // 0' report.json)
+          echo "Score MobSF: ${SCORE} (minimum ${MIN_SCORE})"
+          echo "### Score MobSF: ${SCORE} / 100 (minimum ${MIN_SCORE})" >> "$GITHUB_STEP_SUMMARY"
+          [ "${SCORE%.*}" -ge "${MIN_SCORE}" ]
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mobsf-report
+          path: report.json
