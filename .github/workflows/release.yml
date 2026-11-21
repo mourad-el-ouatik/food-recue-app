@@ -1,0 +1,94 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build AAB signé + provenance
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - uses: android-actions/setup-android@v3
+
+      - run: npm ci
+
+      - name: Prebuild Android
+        run: npx expo prebuild --platform android --no-install --clean
+        env:
+          EXPO_PUBLIC_API_URL: ${{ vars.PROD_API_URL }}
+
+      - name: Décoder le keystore
+        run: echo "${{ secrets.ANDROID_KEYSTORE_B64 }}" | base64 -d > "$RUNNER_TEMP/release.jks"
+
+      - name: Build AAB signé
+        working-directory: android
+        env:
+          ANDROID_KEYSTORE_PATH: ${{ runner.temp }}/release.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+        run: |
+          ./gradlew bundleRelease --no-daemon \
+            -Pandroid.injected.signing.store.file="$ANDROID_KEYSTORE_PATH" \
+            -Pandroid.injected.signing.store.password="$ANDROID_KEYSTORE_PASSWORD" \
+            -Pandroid.injected.signing.key.alias="$ANDROID_KEY_ALIAS" \
+            -Pandroid.injected.signing.key.password="$ANDROID_KEY_PASSWORD"
+
+      - name: Supprimer le keystore
+        if: always()
+        run: rm -f "$RUNNER_TEMP/release.jks"
+
+      - name: Attestation de provenance (SLSA)
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-path: android/app/build/outputs/bundle/release/*.aab
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: aab
+          path: android/app/build/outputs/bundle/release/*.aab
+
+  deploy:
+    name: Déploiement Play (canal interne)
+    needs: build
+    runs-on: ubuntu-latest
+    # Approbation manuelle via les relecteurs requis de l'environnement
+    environment: production
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: aab
+          path: aab
+
+      - uses: r0adkll/upload-google-play@v1
+        with:
+          serviceAccountJsonPlainText: ${{ secrets.PLAY_SERVICE_ACCOUNT_JSON }}
+          packageName: com.example.mobileapp
+          releaseFiles: aab/*.aab
+          track: internal
+          status: completed
